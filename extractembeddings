@@ -1,0 +1,120 @@
+#!/usr/bin/env python3
+"""Task 2: extract and save CLIP text + image embeddings for every post in clean_pairs.csv.
+
+Setup:  pip3 install torch transformers pillow numpy pandas
+Test:   python3 extract_embeddings.py --input clean/clean_pairs.csv --out-dir embeddings/ --limit 50
+Full:   python3 extract_embeddings.py --input clean/clean_pairs.csv --out-dir embeddings/
+
+Outputs in --out-dir:
+  text_embs.npy        [N, D] float32. Row i = caption embedding of post embedding_ids[i]
+  img_embs.npy         [N, D] float32. Row i = image embedding of the SAME post
+  embedding_ids.csv    column post_id, in the same row order as the two .npy files
+  embedding_meta.json  model name, embedding size, counts, device, truncation stats
+  skipped.csv          (only if some images failed to open)
+
+Notes:
+  * Embeddings are L2-normalized by default (standard for CLIP). Use --no-normalize to keep raw.
+  * CLIP reads at most 77 tokens of text; longer captions are cut. The count is reported.
+"""
+import argparse
+import json
+import time
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+from PIL import Image
+from transformers import CLIPModel, CLIPProcessor
+
+MAX_TOKENS = 77
+
+
+def pick_device():
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"  # Apple Silicon Macs
+    return "cpu"
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="clean_pairs.csv from Task 1")
+    ap.add_argument("--out-dir", default="embeddings")
+    ap.add_argument("--model", default="openai/clip-vit-base-patch32")
+    ap.add_argument("--batch-size", type=int, default=32)
+    ap.add_argument("--limit", type=int, default=None, help="only process the first N rows (for a quick test)")
+    ap.add_argument("--no-normalize", action="store_true")
+    a = ap.parse_args()
+
+    out = Path(a.out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+
+    df = pd.read_csv(a.input, dtype={"post_id": str})
+    if a.limit:
+        df = df.head(a.limit)
+    device = pick_device()
+    print(f"Rows: {len(df)} | device: {device} | model: {a.model}")
+
+    model = CLIPModel.from_pretrained(a.model).to(device).eval()
+    proc = CLIPProcessor.from_pretrained(a.model)
+
+    ids, text_chunks, img_chunks, skipped = [], [], [], []
+    n_trunc = 0
+    t0 = time.time()
+    with torch.no_grad():
+        for start in range(0, len(df), a.batch_size):
+            batch = df.iloc[start:start + a.batch_size]
+            imgs, caps, bids = [], [], []
+            for pid, cap, path in zip(batch["post_id"], batch["caption"], batch["image_path"]):
+                try:
+                    with Image.open(path) as im:
+                        imgs.append(im.convert("RGB"))
+                    caps.append(str(cap))
+                    bids.append(pid)
+                except Exception as e:  # skip the whole post so text and image stay aligned
+                    skipped.append({"post_id": pid, "error": type(e).__name__})
+            if not bids:
+                continue
+
+            n_trunc += sum(len(x) > MAX_TOKENS for x in proc.tokenizer(caps)["input_ids"])
+            inputs = proc(text=caps, images=imgs, return_tensors="pt",
+                          padding=True, truncation=True, max_length=MAX_TOKENS)
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            t = model.get_text_features(input_ids=inputs["input_ids"],
+                                        attention_mask=inputs["attention_mask"])
+            i = model.get_image_features(pixel_values=inputs["pixel_values"])
+            if not a.no_normalize:
+                t = t / t.norm(dim=-1, keepdim=True)
+                i = i / i.norm(dim=-1, keepdim=True)
+
+            text_chunks.append(t.float().cpu().numpy())
+            img_chunks.append(i.float().cpu().numpy())
+            ids.extend(bids)
+            done = start + len(batch)
+            print(f"  {done}/{len(df)} rows ({time.time() - t0:.0f}s)", flush=True)
+
+    if not ids:
+        raise SystemExit("No embeddings were produced. Check the image_path column in your input file.")
+
+    T = np.concatenate(text_chunks).astype(np.float32)
+    I = np.concatenate(img_chunks).astype(np.float32)
+    assert len(ids) == len(T) == len(I)
+
+    np.save(out / "text_embs.npy", T)
+    np.save(out / "img_embs.npy", I)
+    pd.DataFrame({"post_id": ids}).to_csv(out / "embedding_ids.csv", index=False)
+    if skipped:
+        pd.DataFrame(skipped).to_csv(out / "skipped.csv", index=False)
+    meta = {"model": a.model, "dim": int(T.shape[1]), "n_embedded": len(ids),
+            "n_skipped": len(skipped), "n_captions_truncated_at_77_tokens": int(n_trunc),
+            "normalized": not a.no_normalize, "device": device}
+    (out / "embedding_meta.json").write_text(json.dumps(meta, indent=2))
+
+    print("\nDone.", json.dumps(meta, indent=2))
+
+
+if __name__ == "__main__":
+    main()
